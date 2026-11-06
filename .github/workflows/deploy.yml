@@ -1,0 +1,63 @@
+# Branch-scoped secret retrieval with GitHub OIDC: no stored credentials.
+# Akeyless trusts GitHub's OIDC issuer and releases deploy-token only to
+# this repository's main branch (sub-claims on the role association).
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      access_id:
+        description: 'Akeyless access ID of the workshop JWT auth method (p-...)'
+        required: true
+      secret_path:
+        description: 'Secret to read, e.g. /workshops/<slug>/_ci/deploy-token'
+        required: true
+
+permissions:
+  id-token: write   # lets the job request a GitHub OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get a GitHub OIDC token for this run
+        id: oidc
+        run: |
+          set -euo pipefail
+          JWT=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=akeyless" | jq -r '.value')
+          echo "::add-mask::$JWT"
+          echo "jwt=$JWT" >> "$GITHUB_OUTPUT"
+          # The claims Akeyless decides on (the payload is not secret; the signature is the proof)
+          PAYLOAD=$(printf '%s' "$JWT" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="$PAYLOAD="; done
+          printf '%s' "$PAYLOAD" | base64 -d | jq '{repository, ref, sub, workflow, actor}'
+
+      - name: Authenticate to Akeyless and read the secret
+        env:
+          JWT: ${{ steps.oidc.outputs.jwt }}
+          ACCESS_ID: ${{ inputs.access_id }}
+          SECRET_PATH: ${{ inputs.secret_path }}
+        run: |
+          set -euo pipefail
+          AUTH=$(curl -sS -X POST https://api.akeyless.io/auth \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg id "$ACCESS_ID" --arg jwt "$JWT" \
+                  '{"access-id": $id, "access-type": "jwt", "jwt": $jwt}')")
+          TOKEN=$(printf '%s' "$AUTH" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Akeyless denied authentication: $(printf '%s' "$AUTH" | jq -r '.error // "no token"')"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          RESP=$(curl -sS -X POST https://api.akeyless.io/get-secret-value \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$TOKEN" --arg p "$SECRET_PATH" '{token: $t, names: [$p]}')")
+          VALUE=$(printf '%s' "$RESP" | jq -r --arg p "$SECRET_PATH" '.[$p] // empty')
+          if [ -z "$VALUE" ]; then
+            echo "::error::Akeyless denied the read of $SECRET_PATH: $(printf '%s' "$RESP" | jq -r '.error // "no value"')"
+            exit 1
+          fi
+          echo "::add-mask::$VALUE"
+          echo "read $(basename "$SECRET_PATH") (${#VALUE} chars); a real deploy would use it here"
